@@ -1,0 +1,628 @@
+---
+title: "SENESCU_B_FinalProject"
+author: "Ben Senescu"
+date: "November 30, 2018"
+output: html_document
+---
+
+Load in all the packages used in the project
+```{r}
+library(httr)
+library(XML)
+library(RSQLite)
+library(plyr)
+library(jsonlite)
+library(rvest)
+library(RSelenium)
+library(Amelia)
+library(httr)
+library(XML)
+library(RSQLite)
+library(RSelenium)
+library(stringr)
+library(sqldf)
+library(ggplot2)
+library(ROCR)
+library(forecast)
+```
+
+Get a vector of the ticker symbols for all stocks trading on the NASDAQ from the IEX Trading API.
+```{r}
+#call API
+symbol_request <- GET("https://api.iextrading.com/1.0/ref-data/symbols")
+#check that request was successful
+#http_status(api_request)
+
+#get a list of all of the info associated with the symbols
+symbol_list <- content(symbol_request, "parsed")
+
+#convert the list into a data frame
+symbol_df <- data.frame(matrix(unlist(symbol_list), nrow= length(symbol_list), byrow=T),stringsAsFactors=FALSE)
+
+#get a vector of all of the symbols
+allSymbols <- symbol_df$X1
+
+head(allSymbols)
+```
+
+Create a data frame containing the symbol of the stock and what industry it is in. 
+```{r}
+sector_df <- data.frame(Symbol=character(), Sector=character())
+
+#find the sector for each symbol
+for(symbol in allSymbols) {
+  sector <- content(GET(paste("https://api.iextrading.com/1.0/stock/", 
+                                 symbol, "/company?filter=sector", sep = "")), "parsed") 
+  #if null, change it to an NA for easier processing
+  if(is.null(sector$sector)) {
+    sector_df <- rbind(sector_df, data.frame(symbol, sector = NA))
+  } else {
+    #add the new symbol and sector to the growing df
+    sector_df <- rbind(sector_df, data.frame(symbol, sector))
+  }
+}
+head(sector_df)
+```
+
+I chose to remove all empty industry values from the set because industry is the way I plan to group stocks.
+```{r}
+#check how common NA's are in the dataframe
+sapply(sector_df, function(x) sum(is.na(x)))
+
+#change empty sector values to NA
+sector_df$sector[sector_df$sector == ""] <- NA
+
+#remove NA values
+sectorFull_df <- na.omit(sector_df)
+rownames(sectorFull_df) <- 1:nrow(sectorFull_df)
+
+#check that all NA values have been removed
+sapply(sectorFull_df, function(x) sum(is.na(x)))
+
+#take a look at data to confirm
+head(sectorFull_df)
+```
+
+Write the sector df to a csv.
+```{r}
+write.csv(sectorFull_df, "sector_df.csv")
+```
+
+Create a database for stock information.
+```{r}
+dbOpen <- sqldf("attach Stock_db as new")
+Stock_db <- dbConnect(RSQLite::SQLite(), "Stock_db")
+```
+
+Create a table to store the sector df information.
+```{r}
+dbfill <- dbWriteTable(Stock_db, "sector_table", read.csv("sector_df.csv"), overwrite = TRUE, row.names = FALSE, header = TRUE)
+```
+
+Take a look at what industries are most common among the data set.
+```{r}
+dbGetQuery(Stock_db, "SELECT sector, COUNT(*) FROM sector_table
+           GROUP BY sector")
+```
+
+This function takes in an industry of the users choice and returns the ticker symbols of all companies in that industry. 
+```{r}
+filterSymbolsByIndustry <- function(Industry) {
+  return(dbGetQuery(Stock_db, paste("SELECT symbol FROM sector_table WHERE sector = '", Industry, "'", sep = "")))
+}
+
+techSymbols <- filterSymbolsByIndustry("Technology")
+healthcareSymbols <- filterSymbolsByIndustry("Healthcare")
+financialSymbols <- filterSymbolsByIndustry("Financial Services")
+```
+
+Take the unformatted data frame that fromJSON creates and reformat to a tidy df.
+```{r}
+makeDf <- function(df, symbol) {
+  #ensure that there are not null values which cause problems in construcitng dataframes
+  if(nrow(df) == 4) {
+    finalDf <- data.frame(symbol = symbol, q1EPS = df[4, 'actualEPS'], q2EPS = df[3, 'actualEPS'],
+                        q3EPS = df[2, 'actualEPS'], q4EPS = df[1, 'actualEPS'],
+                        q1EPSReportDate = df[4, 'EPSReportDate'], q2EPSReportDate = df[3, 'EPSReportDate'],
+                        q3EPSReportDate = df[2, 'EPSReportDate'], q4EPSReportDate = df[1, 'EPSReportDate'])
+  } else {
+    finalDf <- data.frame()
+  }
+  return(finalDf)
+}
+
+```
+
+Pull the earnings information from the API and create a dataframe representing it.
+```{r}
+makeEarningsDf <- function(Symbols) {
+  url <- paste("https://api.iextrading.com/1.0/stock/", 
+               Symbols[1], "/earnings?filter=actualEPS,EPSReportDate", sep = "")
+  
+  earnings_df <- as.data.frame(fromJSON(content(GET(url), "text"))[["earnings"]])
+  earnings_df <- makeDf(earnings_df, Symbols[1])
+  for(symbol in Symbols[2:length(Symbols)]) {
+    url <- paste("https://api.iextrading.com/1.0/stock/", 
+               symbol, "/earnings?filter=actualEPS,EPSReportDate", sep = "")
+    
+    df <- as.data.frame(fromJSON(content(GET(url), "text"))[["earnings"]])
+    
+    earnings_df <- rbind(earnings_df, makeDf(df, symbol))
+  }
+  return(earnings_df)
+}
+
+techEarnings <- makeEarningsDf(techSymbols$symbol)
+healthcareEarnings <- makeEarningsDf(healthcareSymbols$symbol)
+financialEarnings <- makeEarningsDf(financialSymbols$symbol)
+```
+
+Check the structure of techEarnings.
+```{r}
+head(techEarnings)
+```
+
+Check if there are NA values.
+```{r}
+sapply(techEarnings, function(x) sum(is.na(x)))
+sapply(healthcareEarnings, function(x) sum(is.na(x)))
+sapply(financialEarnings, function(x) sum(is.na(x)))
+```
+
+Remove NA EPS reports because these are what I will be using as predictors for one of my models.
+```{r}
+tidyTechEarnings <- techEarnings[complete.cases(techEarnings),]
+tidyHealthcareEarnings <- healthcareEarnings[complete.cases(healthcareEarnings),]
+tidyFinancialEarnings <- financialEarnings[complete.cases(financialEarnings),]
+head(tidyTechEarnings)
+head(tidyHealthcareEarnings)
+head(tidyFinancialEarnings)
+```
+
+Remove EPS Outliers.
+```{r}
+findOutliers <- function(vector) {
+  zscores <- scale(vector)
+  indicies <- match(zscores[abs(zscores) > 3], zscores)
+  return(vector[indicies])
+}
+
+q1EPSOutliers <- findOutliers(tidyTechEarnings$q1EPS)
+q2EPSOutliers <- findOutliers(tidyTechEarnings$q2EPS)
+q3EPSOutliers <- findOutliers(tidyTechEarnings$q3EPS)
+q4EPSOutliers <- findOutliers(tidyTechEarnings$q4EPS)
+
+print(paste("Q1EPS Outliers:", paste(q1EPSOutliers, collapse = ",")))
+print(paste("Q2EPS Outliers:", paste(q2EPSOutliers, collapse = ",")))
+print(paste("Q3EPS Outliers:", paste(q3EPSOutliers, collapse = ",")))
+print(paste("Q4EPS Outliers:", paste(q4EPSOutliers, collapse = ",")))
+
+tidyTechEarnings <- tidyTechEarnings[-which(tidyTechEarnings$q3EPS %in% q3EPSOutliers),]
+tidyTechEarnings <- tidyTechEarnings[-which(tidyTechEarnings$q1EPS %in% q1EPSOutliers),]
+tidyTechEarnings <- tidyTechEarnings[-which(tidyTechEarnings$q2EPS %in% q2EPSOutliers),]
+tidyTechEarnings <- tidyTechEarnings[-which(tidyTechEarnings$q4EPS %in% q4EPSOutliers),]
+```
+
+Visualize the EPS for all quarters for the technology sector. We can see that the distribution is typically the same throughout the year. Most companies tend to break even or or earn up to $2 per share.
+```{r}
+ggplot(tidyTechEarnings) + 
+  geom_density(aes(x = q1EPS, fill="lightred", alpha = .4)) +
+  geom_density(aes(x = q2EPS, fill="lightgreen", alpha = .4)) +
+  geom_density(aes(x = q3EPS, fill="lightpurple", alpha = .4)) +
+  geom_density(aes(x = q4EPS, fill="lightblue", alpha = .4)) +
+  scale_fill_discrete(name='Quarter',labels=c("1", "2", "3", "4")) +
+  ggtitle("EPS Densities")
+```
+
+Combine all earnings so that my training set is larger to build my model.
+```{r}
+allEarnings <- rbind(tidyTechEarnings, tidyHealthcareEarnings, tidyHealthcareEarnings)
+```
+
+Create training and test sets for the data.
+```{r}
+createTrainingAndTestSets <- function(df){
+  totalRows <- nrow(df)
+  trainingNums <- sample(totalRows, totalRows * .7, replace = FALSE)
+  training_df <- df[trainingNums,]
+  testNums <- setdiff(c(1:totalRows), trainingNums)
+  test_df <- df[testNums,]
+  rownames(training_df) <- 1:nrow(training_df)
+  rownames(test_df) <- 1:nrow(test_df)
+  return(list(training_df, test_df))
+}
+```
+
+Create a new dataframe with an extra column representing and EPS increase or decrease.
+```{r}
+logAllEarnings <- allEarnings
+
+#create a new column representing if the eps increased or decreased
+logAllEarnings$EPSIncrease <- 0
+
+#if earnings in q4 are greater than in q3, change EPSIncrease to 1
+logAllEarnings$EPSIncrease[which(logAllEarnings$q4EPS > logAllEarnings$q3EPS)] <- 1
+
+#create trainging and set sets
+sets <- createTrainingAndTestSets(logAllEarnings)
+trainingLogAllEarnings <- sets[[1]]
+testLogAllEarnings <- sets[[2]]
+head(trainingLogAllEarnings)
+head(testLogAllEarnings)
+```
+
+Create a logistic regression model predicting whether q4EPS would increase or decrease.
+```{r}
+logModel <-  glm(EPSIncrease ~ q1EPS + q2EPS + q3EPS, family = "binomial", data = trainingLogAllEarnings)
+summary(logModel)
+```
+
+Test how accurate the above model was. While it is not extemely accurate, the stock market is extremly volatile and unpredicatable so this a good prediction.
+```{r}
+predictionsForTest <- predict(logModel, newdata = testLogAllEarnings, type = "response")
+predictionsForTest <- ifelse(predictionsForTest > .5, 1, 0)
+modelAccuracy <- mean(predictionsForTest == testLogAllEarnings$EPSIncrease)
+print(paste("The Model was accurate", paste(round(100*modelAccuracy, 2), "%", sep=""), " percent of the time."))
+```
+
+Create a plot depciting the false and true positive rates of the model. 
+Because the area under the curve is greater than the area above, the model has more true positives than false positives.
+```{r}
+predictions <- prediction(predictionsForTest, testLogAllEarnings$EPSIncrease)
+modelPerfomance <- performance(predictions, measure = "tpr", x.measure = "fpr")
+plot(modelPerfomance)
+```
+
+
+Create training and test sets for stocks in the technology sector.
+```{r}
+logTechEarnings <- tidyTechEarnings
+
+#create a new column
+logTechEarnings$EPSIncrease <- 0
+
+#set EPS increase to 1 if EPS increased from q3 to q4
+logTechEarnings$EPSIncrease[which(logTechEarnings$q4EPS > logTechEarnings$q3EPS)] <- 1
+
+#create training and test sets
+trainingLogTechEarnings <- createTrainingAndTestSets(logTechEarnings)[[1]]
+testLogTechEarnings <- createTrainingAndTestSets(logTechEarnings)[[2]]
+
+head(trainingLogTechEarnings)
+head(testLogTechEarnings)
+```
+
+Create a logistic model using the training data for technology stocks only.
+```{r}
+logTechModel <-  glm(EPSIncrease ~ q1EPS + q2EPS + q3EPS, family = "binomial", data = trainingLogTechEarnings)
+summary(logTechModel)
+```
+
+Test if this model is more acurate than the one using the complied earnings from three industries. This was proven true as it was almost 10% more accurate. This makes sense as the sector as a whole trends with the market more than assorted sectors.
+```{r}
+predictionsForTestTech <- predict(logTechModel, newdata = testLogTechEarnings, type = "response")
+predictionsForTestTech <- ifelse(predictionsForTestTech > .5, 1, 0)
+modelAccuracyTech <- mean(predictionsForTestTech == testLogTechEarnings$EPSIncrease)
+print(paste("The Model was accurate", paste(round(100*modelAccuracyTech, 2), "%", sep=""), " percent of the time."))
+```
+
+Reshape df to build holt-winters model.
+```{r}
+holtEarnings <- data.frame(Symbol = character(), EPS = numeric(), ReportDate = character(), Quarter = numeric())
+for(index in 1:nrow(allEarnings)) {
+  holtEarnings <- rbind(holtEarnings, data.frame(Symbol = allEarnings[index, "symbol"], EPS = allEarnings[index, "q1EPS"], ReportDate =  allEarnings[index, "q1EPSReportDate"], Quarter = 1))
+  holtEarnings <- rbind(holtEarnings, data.frame(Symbol = allEarnings[index, "symbol"], EPS = allEarnings[index, "q2EPS"], ReportDate = allEarnings[index, "q2EPSReportDate"], Quarter = 2))
+  holtEarnings <- rbind(holtEarnings, data.frame(Symbol = allEarnings[index, "symbol"], EPS = allEarnings[index, "q3EPS"], ReportDate = allEarnings[index, "q3EPSReportDate"], Quarter = 3))
+  holtEarnings <- rbind(holtEarnings, data.frame(Symbol = allEarnings[index, "symbol"], EPS = allEarnings[index, "q4EPS"], ReportDate = allEarnings[index, "q4EPSReportDate"], Quarter = 4))
+}
+head(holtEarnings)
+```
+
+Create a holt winters model and forecast future EPS. This projection seems accurate because on average comapny's will increase with time as inflation increases and GDP grows. 
+```{r}
+holtEarnings_ts <- ts(data = holtEarnings$EPS, start= 1, end = 4)
+smooth <- holt(holtEarnings_ts)
+autoplot(smooth)
+```
+
+Pull the financial information from the API and create a dataframe representing it.
+```{r}
+makeFinancialsDf <- function(Symbols) {
+  url <- paste("https://api.iextrading.com/1.0/stock/", 
+               Symbols[1], "/financials?period=quarter", sep = "")
+  financialdf <- as.data.frame(fromJSON(content(GET(url), "text"))[["financials"]])
+  financialdf$symbol <- Symbols[1]
+  financialdf$Quarter <- 1
+  financialdf[2, 'Quarter'] <- 2 
+  financialdf[3, 'Quarter'] <- 3
+  financialdf[4, 'Quarter'] <- 4
+  for(symbol in Symbols[2:length(Symbols)]) {
+    url <- paste("https://api.iextrading.com/1.0/stock/", 
+               symbol, "/financials?period=quarter", sep = "")
+    df <- as.data.frame(fromJSON(content(GET(url), "text"))[["financials"]])
+    if(nrow(df > 0)) {
+      df$symbol <- symbol
+    df$Quarter <- 1
+    df[2, 'Quarter'] <- 2 
+    df[3, 'Quarter'] <- 3
+    df[4, 'Quarter'] <- 4
+    financialdf <- rbind(financialdf, df)
+    }
+  }
+  return(financialdf)
+}
+
+techFinancials <- makeFinancialsDf(techSymbols$symbol)
+```
+
+Observe the missing values in the data frame.
+```{r}
+missmap(techFinancials, main = "Missing values vs observed")
+```
+
+Remove columns that have too much missing info and impute data into cash change. 
+```{r}
+tidyTechFinancials <- techFinancials
+tidyTechFinancials$researchAndDevelopment <- NULL
+tidyTechFinancials$currentDebt <- NULL
+tidyTechFinancials$totalDebt <- NULL
+tidyTechFinancials$operatingGainsLosses <- NULL
+missmap(tidyTechFinancials, main = "Missing values vs observed")
+```
+
+Remove rows representing stocks that have NA values. If any stock ticker has an NA in one of its four rows, delete all rows related to it because the stock loses its signifigance to my analysis if it is not accopanied by its accompanying quarter info.  
+```{r}
+noRevenueSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$totalRevenue)]
+noRevenueSymbols <- which(tidyTechFinancials$symbol %in% noRevenueSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noRevenueSymbols,]
+
+noCashSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$cashFlow)]
+noCashSymbols <- which(tidyTechFinancials$symbol %in% noCashSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noCashSymbols,]
+
+noCashChangeSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$cashChange)]
+noCashChangeSymbols <- which(tidyTechFinancials$symbol %in% noCashChangeSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noCashChangeSymbols,]
+
+noAssetsSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$totalAssets)]
+noAssetsSymbols <- which(tidyTechFinancials$symbol %in% noAssetsSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noAssetsSymbols,]
+
+noProfitsSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$grossProfit)]
+noProfitsSymbols <- which(tidyTechFinancials$symbol %in% noProfitsSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noProfitsSymbols,]
+
+noSharesSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$shareholderEquity)]
+noSharesSymbols <- which(tidyTechFinancials$symbol %in% noSharesSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noSharesSymbols,]
+
+noTotalCashChangeSymbols <- tidyTechFinancials$symbol[is.na(tidyTechFinancials$totalCash)]
+noTotalCashChangeSymbols <- which(tidyTechFinancials$symbol %in% noTotalCashChangeSymbols)
+tidyTechFinancials <- tidyTechFinancials[-noTotalCashChangeSymbols,]
+
+missmap(tidyTechFinancials, main = "Missing values vs observed")
+```
+
+Confirm there are no NA values left in the df.
+```{r}
+sapply(tidyTechFinancials, function(x) sum(is.na(x)))
+```
+
+Create a csv representing tech financials and write a table to the stock data base storing it. 
+```{r}
+write.csv(tidyTechFinancials, "techFinancial_df.csv")
+dbfill2 <- dbWriteTable(Stock_db, "techFinancials_table", read.csv("techFinancial_df.csv"), overwrite = TRUE, row.names = FALSE, header = TRUE)
+```
+
+Check that the table was stored correctly.
+```{r}
+techFinancials_df <- dbGetQuery(Stock_db, "SELECT * FROM techFinancials_table")
+head(techFinancials_df)
+```
+
+Get the total Revenue for each stock in the most recent quarter
+```{r}
+revenues <- dbGetQuery(Stock_db, "SELECT symbol, totalRevenue FROM techFinancials_table WHERE Quarter = 4")
+revenues <- revenues[!is.na(revenues$totalRevenue),]
+head(revenues)
+```
+
+Find the outliers in the revenue set. 
+It makes sense that the outliers are very high revenue totals because extra large companies make up a dispropiante percentage of gdp.
+```{r}
+totalRevenueOutliers <- findOutliers(revenues$totalRevenue)
+print(paste("Total Revenue Outliers:", paste(totalRevenueOutliers, collapse = ",")))
+```
+
+Creates a histogram representing the frequency of revenue bins. This shows that most companies have smaller revenues
+```{r}
+revenuesNoOutliers <- revenues[-which(revenues$totalRevenue %in% totalRevenueOutliers),]
+ggplot(data = revenuesNoOutliers, mapping = aes(x = totalRevenue)) + 
+  geom_histogram(bins=1000) + theme_light()
+```
+
+Create a new table for revenue to make the filtering process easier for the next queries.
+```{r}
+dbFill3 <- dbWriteTable(Stock_db, "totalRevenue_table", revenuesNoOutliers, overwrite =TRUE)
+```
+
+Create bins representing more infromative break points for companie's revenue.
+```{r}
+under1million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 1000000")
+under10million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 10000000 AND totalRevenue > 1000000")
+under50million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 50000000 AND totalRevenue > 10000000")
+under200million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 200000000 AND totalRevenue > 50000000")
+under500million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 500000000 AND totalRevenue >200000000")
+under750million <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 750000000 AND totalRevenue > 500000000")
+under1.25billion <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 1250000000 AND totalRevenue > 750000000")
+under2billion <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue < 2000000000 AND totalRevenue > 1250000000")
+over2billion <- dbGetQuery(Stock_db, "SELECT Count(*) FROM totalRevenue_table WHERE totalRevenue > 2000000000")
+revenueBins <- rbind(under1million, under10million, under50million, under200million, under500million, under750million, under1.25billion, under2billion, over2billion)
+names(revenueBins) <- "Count"
+```
+
+Create a historgram visualizing how many companies fit into set revenue bins starting from 1 million and ending with 10 billion
+```{r}
+ggplot(revenueBins,aes(seq_along(revenueBins$Count),revenueBins$Count)) +
+  geom_bar(stat="identity", fill = "#FF6666") + 
+  xlab("Most Recent Quarter Revenue") +
+  ylab("Number of Companies") +
+  scale_x_discrete(limits=c("1 Million", "10 Million", "50 Million" , "200 Million" , "500 Million" , "750 Million" , "1.25 Billion", "2 Billion", "Over 2 Billion")) +
+  ggtitle("Companie Total Revenue Recent Quarter")
+```
+
+
+I created a web scraper which iterates over my earnings df. It extracts from the df the symbol (which it inputs as the hashtag), the report date for q3 and the report date for q4. 
+These values are input into text fields of the twiter advanced search page and then my scraper hits enter to search. It then is sent to a webpage which shows the top tweets related 
+to that hashtag during the desired period. One issue with this web scraper is that if company is tweeted about more than 20 times, it can only take into account the twenty tweets on 
+the webpage. I will handle this issue later in my analysis.
+```{r}
+#bug with zeros in day digits
+removeZero <- function(string) {
+  end <- substring(string, 9, 10)
+  string <- substring(string, 1, 8)
+  end <- str_replace(end, "0", "")
+  return(paste(string, end, sep = ""))
+}
+
+getCountOfTweets <- function(url) {
+  #Reading the HTML code from the website
+  webpage <- read_html(url)
+
+  #Using CSS selectors to scrap the rankings section
+  tweet_data_html <- html_nodes(webpage,'.js-original-tweet')
+
+  #Converting the ranking data to character vector
+  tweets <- html_text(tweet_data_html)
+  
+  return(length(tweets))
+}
+
+rD <- rsDriver() # runs a chrome browser, wait for necessary files to download
+remDr <- rD$client
+remDr$open()
+getTwitterVolumes <- function(df){
+  df$tweetVolume <- 0
+  for(index in 1:nrow(df)) {
+    #load twitter page
+    remDr$navigate("https://twitter.com/search-advanced")
+    
+    #add "price" to text search box
+    priceBox <- remDr$findElement(using = 'css selector', "fieldset:nth-child(1) .txt:nth-child(3) input")
+    priceBox$sendKeysToElement(list("price"))
+    
+    #add ticker symbol to hastag box
+    hashtagBox <- remDr$findElement(using = 'css selector', ".txt:nth-child(6) input")
+    hashtagBox$sendKeysToElement(list(df[index, 'symbol']))
+    
+    #add q3reportdate to since box
+    sinceBox <- remDr$findElement(using = 'css selector', "#since")
+    sinceBox$sendKeysToElement(list(removeZero(df[index, 'q3EPSReportDate'])))
+    
+    #add q4reportdate to until box
+    untilBox <- remDr$findElement(using = 'css selector', "#until")
+    untilBox$sendKeysToElement(list(removeZero(df[index, 'q4EPSReportDate'])))
+    
+    #hit enter to search the inputs
+    hitEnter <- remDr$findElement(using = 'css selector', "fieldset:nth-child(1) legend+ .txt input")
+    hitEnter$sendKeysToElement(list("\uE007", "\uE007"))
+  
+    #add tweet volume to df
+    df[index, 'tweetVolume'] <- getCountOfTweets(remDr$getCurrentUrl()[[1]])
+  }
+  return(df)
+}
+
+tidyTechEarningsTweets <- getTwitterVolumes(tidyTechEarnings)
+row.names(tidyTechEarningsTweets) <- c(1:nrow(tidyTechEarningsTweets))
+head(tidyTechEarningsTweets)
+```
+
+Clean the new data and to data frame which integrates tweets and earnings data.
+```{r}
+tidyTechFinancialsTweets <- tidyTechFinancials
+tidyTechFinancialsTweets$tweetVolume <- -1
+for(index in 1:nrow(tidyTechEarningsTweets)) {
+  tweetVolume <- tidyTechEarningsTweets[index, 'tweetVolume']
+  if(tidyTechEarningsTweets[index, 'symbol'] %in% tidyTechFinancialsTweets$symbol) {
+    earningsSymbol <- tidyTechEarningsTweets[index, 'symbol']
+    
+    #get 4th quarter index of the symbol
+    financialIndex <- which(tidyTechFinancialsTweets$symbol == earningsSymbol)[4]
+    
+    #add tweet voume to tech financials
+    tidyTechFinancialsTweets[financialIndex, 'tweetVolume'] <-tweetVolume
+  }
+}
+
+head(tidyTechFinancialsTweets)
+```
+
+Create a new data frame with only the most recent quarter and stocks that have tweet information. 
+There were discrepencies bewteen stock that were in earnings and stocks within financials so they must be combined.
+```{r}
+fourthQuarterTweetsAndFinancials_df <- tidyTechFinancialsTweets[which(tidyTechFinancialsTweets$Quarter == 4),]
+fourthQuarterTweetsAndFinancials_df <- fourthQuarterTweetsAndFinancials_df[which(fourthQuarterTweetsAndFinancials_df$tweetVolume > -1),]
+head(fourthQuarterTweetsAndFinancials_df)
+nrow(fourthQuarterTweetsAndFinancials_df)
+```
+
+Here is a plot representing the tweet volume for a company versus the total revenue of the company. It demonstarate the issue with the cap at twenty tweets because many companies have more than I can
+scape from twitter. It also shows that most most comapnies have zero tweets under its hashtag and that many companies are tweeted about more often, but that it is not necessarily correlated to its
+revenue, but to quality social media campaigns or other factors.
+```{r}
+ggplot(fourthQuarterTweetsAndFinancials_df, aes(x=totalRevenue, y=tweetVolume)) +
+  geom_point(size=2, shape=23) +
+  ggtitle("Total Revenue versus Tweet Volume")
+```
+
+Remove all tweet volumes of twenty because they are not accurate data points.
+```{r}
+fourthQuarterTweetsAndFinancials_df <- fourthQuarterTweetsAndFinancials_df[which(fourthQuarterTweetsAndFinancials_df$tweetVolume < 20),]
+```
+
+This scatter plot gives a better representation of the lack of correlation between Revenue and Tweet Volume.
+```{r}
+ggplot(fourthQuarterTweetsAndFinancials_df, aes(x=totalRevenue, y=tweetVolume)) +
+  geom_point(size=2, shape=21) + 
+  ggtitle("Total Revenue versus Tweet Volume")
+```
+
+Find the pearson coeffecient for tweetVolume and Total Revenue. I chose to use Pearson because the relationship between the two should be linear. The relationsip is positive confirming that as tweetVolume increase so does totalRevenue, but the relationship is weak confirming a visual analyis. However it does confirm that there is at least some relationship between the two. 
+```{r}
+cor(fourthQuarterTweetsAndFinancials_df$tweetVolume, fourthQuarterTweetsAndFinancials_df$totalRevenue,  method = "pearson")
+```
+
+Prepare the dataframe to create a linear regression model. Remove any variables which are unique to a stock. 
+```{r}
+linearModelTechTweets <- fourthQuarterTweetsAndFinancials_df
+linearModelTechTweets$symbol <- NULL
+linearModelTechTweets$reportDate <- NULL
+linearModelTechTweets$Quarter <- NULL
+trainingLinearModelTechTweets <- createTrainingAndTestSets(linearModelTechTweets)[[1]]
+testLinearModelTechTweets <- createTrainingAndTestSets(linearModelTechTweets)[[2]]
+fullSet <- lm(formula = tweetVolume ~., data = trainingLinearModelTechTweets)
+summary(fullSet)
+```
+
+
+Step through the model for optimization.
+```{r}
+optimizedModel <- step(fullSet, trainingLinearModelTechTweets, direction = "backward")
+```
+
+Ajusted R-squared Analysis:
+It has an adjusted R^2 of .1151 which is very weak. Overall, I have discovered that tweet volume and company success factors are not strongly related at all, but I did not think that they would be this weakly related which is eye-opeing. This is most likely because not all successful companies are consumer facing which is where the power of social media lies. Unless a company is extremley lare, an outlier, that company will not recieve press coverage and social media coverage unless it is consumer
+
+P-Value Analysis:
+Current Assets and totalCash both have extremely low p-values meaning that they are very signifigant in relation to tweetVolume. Additionally, all variables have p-values below 0.05 meaning that they are also statistically signifigant.  It is very interesting that while these variables are statistically signifigant to creating the model, they are not actually quality predictors of tweet volume which is why it is necessary to analyze a model holisticaly.  
+
+Stocks are a gladiator sport.
+```{r}
+summary(optimizedModel)
+```
+
+Disconnect from database.
+```{r}
+dbDisconnect(Stock_db)
+```
